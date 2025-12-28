@@ -1,0 +1,51 @@
+{
+  "name": "Example Configuration",
+  "description": "This is an example configuration for the transaction engine.",
+  "flow_definitions": [
+    {
+      "id": "flow_1",
+      "name": "Sample Flow",
+      "description": "A sample transaction flow for demonstration purposes.",
+      "flow_type": "business",
+      "version": 1,
+      "defination": {
+        "tasks": [
+          {
+            "id": "task_1",
+            "name": "HTTP Request Task",
+            "type": "http",
+            "config": {
+              "url": "https://api.example.com/resource",
+              "method": "GET",
+              "headers": {
+                "Authorization": "Bearer token"
+              }
+            }
+          },
+          {
+            "id": "task_2",
+            "name": "Database Task",
+            "type": "db",
+            "config": {
+              "query": "INSERT INTO example_table (column1, column2) VALUES (?, ?)",
+              "params": ["value1", "value2"]
+            }
+          }
+        ]
+      },
+      "is_active": true,
+      "created_at": "2023-10-01T00:00:00Z",
+      "updated_at": "2023-10-01T00:00:00Z",
+      "create_user": "admin",
+      "updated_user": "admin"
+    }
+  ],
+  "retry_policy": {
+    "policy_type": "exponential",
+    "base_interval": 30,
+    "max_interval": 300,
+    "max_attempts": 5,
+    "multiplier": 2.0,
+    "randomization_factor": 0.1
+  }
+}

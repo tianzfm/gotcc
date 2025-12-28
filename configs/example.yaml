@@ -1,0 +1,42 @@
+id: "example-flow"
+name: "Example Transaction Flow"
+description: "An example configuration for the transaction flow."
+flow_type: "business"
+version: 1
+is_active: true
+defination:
+  tasks:
+    - id: "task1"
+      name: "HTTP Request Task"
+      type: "http"
+      config:
+        url: "https://api.example.com/resource"
+        method: "GET"
+        headers:
+          Authorization: "Bearer token"
+      retry_policy:
+        id: 1
+        max_attempts: 3
+        backoff_strategy: "exponential"
+    - id: "task2"
+      name: "Database Task"
+      type: "db"
+      config:
+        query: "INSERT INTO example_table (column1, column2) VALUES (?, ?)"
+        params:
+          - "value1"
+          - "value2"
+      retry_policy:
+        id: 2
+        max_attempts: 2
+        backoff_strategy: "fixed"
+    - id: "task3"
+      name: "Message Queue Task"
+      type: "mq"
+      config:
+        queue_name: "example_queue"
+        message: "Hello, World!"
+      retry_policy:
+        id: 3
+        max_attempts: 5
+        backoff_strategy: "randomized"

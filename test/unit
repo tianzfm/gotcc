@@ -1,0 +1,55 @@
+package unit
+
+import (
+	"testing"
+	"github.com/stretchr/testify/assert"
+	"gotcc/internal/engine"
+	"gotcc/internal/executor"
+	"gotcc/internal/persistence"
+	"gotcc/internal/model"
+)
+
+func TestTransactionFlow(t *testing.T) {
+	// Initialize necessary components for testing
+	store := persistence.NewStore()
+	engine := engine.NewEngine(store)
+	executor := executor.NewExecutor()
+
+	// Define a sample flow
+	flow := model.Flow{
+		ID: "flow1",
+		Name: "Sample Flow",
+		Description: "A sample transaction flow for testing",
+		Tasks: []model.Task{
+			{
+				ID: "task1",
+				Name: "Task 1",
+				Type: "http",
+			},
+			{
+				ID: "task2",
+				Name: "Task 2",
+				Type: "db",
+			},
+		},
+	}
+
+	// Start the transaction flow
+	err := engine.StartFlow(flow)
+	assert.NoError(t, err)
+
+	// Check the status of the flow
+	status := engine.GetFlowStatus(flow.ID)
+	assert.Equal(t, "running", status)
+
+	// Simulate task execution
+	err = executor.ExecuteTask(flow.Tasks[0])
+	assert.NoError(t, err)
+
+	// Verify task status
+	taskStatus := engine.GetTaskStatus(flow.Tasks[0].ID)
+	assert.Equal(t, "success", taskStatus)
+
+	// Clean up
+	engine.CancelFlow(flow.ID)
+}

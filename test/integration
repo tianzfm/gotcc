@@ -1,0 +1,56 @@
+package integration
+
+import (
+    "testing"
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/require"
+    "gotcc/internal/engine"
+    "gotcc/internal/executor"
+    "gotcc/internal/persistence"
+    "gotcc/internal/model"
+)
+
+func TestTransactionFlow(t *testing.T) {
+    // Initialize the engine and persistence layer
+    store := persistence.NewStore()
+    engine := engine.NewEngine(store)
+
+    // Define a sample flow
+    flow := model.Flow{
+        ID:          "flow1",
+        Name:        "Sample Flow",
+        Description: "A sample transaction flow for testing",
+        FlowType:    "business",
+        Version:     1,
+        Definition:  nil, // Add appropriate JSON definition here
+        IsActive:    true,
+    }
+
+    // Create the flow in the persistence layer
+    err := store.CreateFlow(&flow)
+    require.NoError(t, err)
+
+    // Create a sample task
+    task := model.Task{
+        ID:      "task1",
+        GroupID: "group1",
+        Name:    "Sample Task",
+        Type:    "http",
+        Status:  "pending",
+        Config:  nil, // Add appropriate JSON config here
+    }
+
+    // Execute the task
+    executor := executor.NewExecutor()
+    err = executor.Execute(&task)
+    require.NoError(t, err)
+
+    // Verify the task status
+    taskStatus, err := store.GetTaskStatus(task.ID)
+    require.NoError(t, err)
+    assert.Equal(t, "success", taskStatus)
+
+    // Clean up
+    err = store.DeleteFlow(flow.ID)
+    require.NoError(t, err)
+}

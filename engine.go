@@ -1,165 +1,266 @@
 // engine.go
+package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
 	"time"
-	"gopkg.in/yaml.v2"
+
+	"register"
 )
 
-type DistributedEngine struct {
-	workflowConfig *TransactionFlow
-	taskStore      map[string]*TaskInstance
-	httpClient     *HTTPClient
+// Minimal flow / policy / task models used by engine.
+// If your project already defines these, keep those and remove duplicates.
+type RetryPolicy struct {
+	MaxAttempts       int     `yaml:"maxAttempts" json:"maxAttempts"`
+	BackoffAlgorithm  string  `yaml:"backoff" json:"backoff"` // "exponential"|"fixed"
+	InitialIntervalMs int     `yaml:"initialIntervalMs" json:"initialIntervalMs"`
+	Multiplier        float64 `yaml:"multiplier" json:"multiplier"`
+	MaxIntervalMs     int     `yaml:"maxIntervalMs" json:"maxIntervalMs"`
+	IntervalMs        int     `yaml:"intervalMs" json:"intervalMs"`
 }
 
-func NewDistributedEngine(configPath string) (*DistributedEngine, error) {
-	engine := &DistributedEngine{
+type ActionConfig struct {
+	ID              string                 `yaml:"id" json:"id"`
+	Name            string                 `yaml:"name" json:"name"`
+	Type            string                 `yaml:"type" json:"type"`
+	ComponentID     string                 `yaml:"component" json:"component"`
+	Config          map[string]interface{} `yaml:"config" json:"config"`
+	RetryPolicy     string                 `yaml:"retryPolicy" json:"retryPolicy"`
+	RequestTemplate string                 `yaml:"requestTemplate" json:"requestTemplate"`
+}
+
+type TransactionFlow struct {
+	Name          string                 `yaml:"name" json:"name"`
+	Actions       []ActionConfig         `yaml:"actions" json:"actions"`
+	RetryPolicies map[string]RetryPolicy `yaml:"retryPolicies" json:"retryPolicies"`
+}
+
+type TaskInstance struct {
+	ID          string
+	ActionID    string
+	ActionName  string
+	Component   register.TaskComponent
+	Input       json.RawMessage
+	Output      json.RawMessage
+	TryTimes    int
+	Status      string
+	NextRetryAt time.Time
+	ErrorMsg    string
+}
+
+// DistributedEngine is component-driven: it builds TaskComponents from action configs
+// then runs Try for every action, and on success runs Confirm for all; on failure runs Cancel for already-tryed ones.
+type FlowLoader func(ctx context.Context, flowID string) (*TransactionFlow, error)
+
+type DistributedEngine struct {
+	// FlowLoader loads a TransactionFlow by its ID from persistence.
+	FlowLoader FlowLoader
+	httpClient *HTTPClient
+	taskStore  map[string]*TaskInstance
+}
+
+// NewDistributedEngine loads a yaml flow file and returns an engine.
+// NewDistributedEngine creates an engine that uses the provided FlowLoader to
+// load flows by ID at execution time.
+func NewDistributedEngine(loader FlowLoader) (*DistributedEngine, error) {
+	if loader == nil {
+		return nil, errors.New("flow loader required")
+	}
+	e := &DistributedEngine{
+		FlowLoader: loader,
 		taskStore:  make(map[string]*TaskInstance),
 		httpClient: NewHTTPClient(),
 	}
-
-	// 加载配置
-	if err := engine.loadConfig(configPath); err != nil {
-		return nil, err
-	}
-
-	return engine, nil
+	return e, nil
 }
 
-// 加载工作流配置
-func (e *DistributedEngine) loadConfig(configPath string) error {
-	data, err := ReadFile(configPath)
+// ExecuteTransaction drives a single transaction identified by txID (generated if empty).
+// params is serialized and passed as payload to Try.
+func (e *DistributedEngine) ExecuteTransaction(ctx context.Context, flowID string, params map[string]interface{}) (string, error) {
+	txID := GenerateTransactionID()
+	// load flow by id
+	flow, err := e.FlowLoader(ctx, flowID)
 	if err != nil {
-		return fmt.Errorf("读取配置文件失败: %v", err)
+		return txID, fmt.Errorf("load flow %s failed: %w", flowID, err)
 	}
 
-	var flow struct {
-		TransactionFlow TransactionFlow `yaml:"transactionFlow"`
+	// build task instances (components + inputs)
+	tasks, err := e.buildTasks(flow, params)
+	if err != nil {
+		return txID, err
 	}
 
-	if err := yaml.Unmarshal(data, &flow); err != nil {
-		return fmt.Errorf("解析YAML配置失败: %v", err)
+	log.Printf("Transaction %s started flow=%s tasks=%d", txID, flow.Name, len(tasks))
+
+	// 1) Try phase: sequential here (can be parallel based on task config)
+	tried := make([]*TaskInstance, 0, len(tasks))
+	for _, t := range tasks {
+		if err := e.tryWithRetry(ctx, txID, flow, t); err != nil {
+			// Try failed after retries -> trigger compensation for those succeeded
+			log.Printf("task Try failed: %s, triggering compensation", t.ActionName)
+			e.compensate(ctx, txID, reverseTasks(tried))
+			return txID, fmt.Errorf("transaction failed: %w", err)
+		}
+		tried = append(tried, t)
 	}
 
-	e.workflowConfig = &flow.TransactionFlow
-	return nil
-}
-
-// 执行事务流程
-func (e *DistributedEngine) ExecuteTransaction(ctx context.Context, params map[string]interface{}) (string, error) {
-	transactionID := GenerateTransactionID()
-
-	log.Printf("开始执行事务流程: %s, ID: %s", e.workflowConfig.Name, transactionID)
-
-	// 创建任务实例
-	tasks := e.createTaskInstances(transactionID, params)
-
-	// 顺序执行所有Action
-	for i, task := range tasks {
-		if err := e.executeActionWithRetry(ctx, task); err != nil {
-			log.Printf("任务执行失败: %s, 开始回滚", task.ActionName)
-
-			// 执行补偿操作
-			e.executeCompensation(ctx, tasks[:i])
-
-			return transactionID, fmt.Errorf("事务执行失败: %v", err)
+	// 2) Confirm phase: if all Try succeeded, confirm all (in original order)
+	for _, t := range tasks {
+		if _, err := t.Component.Confirm(ctx, txID); err != nil {
+			// Confirm failed -> this is serious: try to Cancel where possible and alert
+			log.Printf("Confirm failed for %s: %v", t.ActionName, err)
+			e.compensate(ctx, txID, reverseTasks(tasks))
+			return txID, fmt.Errorf("confirm failed: %w", err)
 		}
 	}
 
-	log.Printf("事务流程执行完成: %s", transactionID)
-	return transactionID, nil
+	log.Printf("Transaction %s completed successfully", txID)
+	return txID, nil
 }
 
-// 带重试的任务执行
-func (e *DistributedEngine) executeActionWithRetry(ctx context.Context, task *TaskInstance) error {
-	policyName := e.getActionRetryPolicy(task.ActionID)
-	policy := e.workflowConfig.RetryPolicies[policyName]
+// buildTasks constructs TaskInstances by instantiating registered components.
+func (e *DistributedEngine) buildTasks(flow *TransactionFlow, params map[string]interface{}) ([]*TaskInstance, error) {
+	// serialize params once
+	payload, _ := json.Marshal(params)
+	var tasks []*TaskInstance
+	for _, a := range flow.Actions {
+		// marshal action config to json.RawMessage for factory
+		cfgBytes, _ := json.Marshal(a.Config)
+		comp, err := register.BuildComponent(a.ComponentID, cfgBytes)
+		if err != nil {
+			return nil, fmt.Errorf("无法构建组件 %s: %w", a.ComponentID, err)
+		}
+		// Prepare and Validate lifecycle
+		if err := comp.Prepare(cfgBytes); err != nil {
+			return nil, fmt.Errorf("组件 Prepare 失败: %w", err)
+		}
+		if err := comp.Validate(); err != nil {
+			return nil, fmt.Errorf("组件 Validate 失败: %w", err)
+		}
 
-	for attempt := 0; attempt < policy.MaxAttempts; attempt++ {
-		task.TryTimes = attempt + 1
-		task.Status = StatusExecuting
-		task.ModifiedTime = time.Now()
+		t := &TaskInstance{
+			ID:         GenerateTransactionID(), // task id; replace by better id if needed
+			ActionID:   a.ID,
+			ActionName: a.Name,
+			Component:  comp,
+			Input:      payload,
+			Status:     "pending",
+		}
+		tasks = append(tasks, t)
+	}
+	return tasks, nil
+}
 
-		log.Printf("执行任务: %s, 尝试次数: %d/%d", task.ActionName, attempt+1, policy.MaxAttempts)
+// tryWithRetry executes Try on a task with retry policy.
+func (e *DistributedEngine) tryWithRetry(ctx context.Context, txID string, flow *TransactionFlow, t *TaskInstance) error {
+	policy := e.resolveRetryPolicyForAction(flow, t.ActionID)
+	max := 1
+	if policy != nil && policy.MaxAttempts > 0 {
+		max = policy.MaxAttempts
+	}
 
-		// 执行具体任务
-		result, err := e.executeSingleAction(ctx, task)
-
-		if err == nil {
-			// 执行成功
-			task.Status = StatusSuccess
-			task.OutputResult = result
-			log.Printf("任务执行成功: %s", task.ActionName)
+	var lastErr error
+	for attempt := 0; attempt < max; attempt++ {
+		t.TryTimes = attempt + 1
+		req := &register.TCCReq{
+			TxID:    txID,
+			Payload: t.Input,
+		}
+		resp, err := t.Component.Try(ctx, req)
+		if err == nil && resp != nil && resp.Success {
+			// success
+			if resp.Result != nil {
+				t.Output = resp.Result
+			}
+			t.Status = "success"
 			return nil
 		}
-
-		// 执行失败
-		task.ErrorMsg = err.Error()
-
-		if attempt == policy.MaxAttempts-1 {
-			// 最后一次尝试也失败
-			task.Status = StatusFailed
-			log.Printf("任务最终失败: %s, 错误: %v", task.ActionName, err)
-			return err
+		// failure path
+		if err == nil && resp != nil {
+			lastErr = errors.New(resp.Error)
+		} else {
+			lastErr = err
 		}
-
-		// 计算下次重试时间
-		delay := e.calculateRetryDelay(policy, attempt)
-		task.NextRetryTime = time.Now().Add(delay)
-		task.Status = StatusRetrying
-
-		log.Printf("任务执行失败: %s, %v后重试", task.ActionName, delay)
-		time.Sleep(delay)
+		t.ErrorMsg = lastErr.Error()
+		t.Status = "retrying"
+		// if last attempt, mark failed
+		if attempt == max-1 {
+			t.Status = "failed"
+			return fmt.Errorf("task %s try failed after %d attempts: %w", t.ActionName, attempt+1, lastErr)
+		}
+		// wait according to backoff
+		delay := time.Duration(1000) * time.Millisecond
+		if policy != nil {
+			delay = calculateDelay(*policy, attempt)
+		}
+		t.NextRetryAt = time.Now().Add(delay)
+		log.Printf("task %s will retry after %v (attempt %d/%d)", t.ActionName, delay, attempt+1, max)
+		select {
+		case <-time.After(delay):
+			// retry
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
+	return lastErr
+}
 
+// compensate runs Cancel on tasks (in reverse order). If a component doesn't support compensation it logs an alert.
+func (e *DistributedEngine) compensate(ctx context.Context, txID string, tasks []*TaskInstance) {
+	for _, t := range tasks {
+		if !t.Component.SupportsCompensation() {
+			log.Printf("组件 %s 不支持补偿, 任务 %s 需要人工介入", t.Component.ID(), t.ActionName)
+			// here you could push an alert to monitoring/notification
+			continue
+		}
+		if _, err := t.Component.Cancel(ctx, txID); err != nil {
+			log.Printf("补偿失败 task=%s err=%v", t.ActionName, err)
+			// optionally retry cancellation or escalate
+		} else {
+			log.Printf("补偿成功 task=%s", t.ActionName)
+		}
+	}
+}
+
+// helpers
+
+func reverseTasks(in []*TaskInstance) []*TaskInstance {
+	out := make([]*TaskInstance, 0, len(in))
+	for i := len(in) - 1; i >= 0; i-- {
+		out = append(out, in[i])
+	}
+	return out
+}
+
+func (e *DistributedEngine) resolveRetryPolicyForAction(flow *TransactionFlow, actionID string) *RetryPolicy {
+	// find action config
+	for _, a := range flow.Actions {
+		if a.ID == actionID {
+			if rp, ok := flow.RetryPolicies[a.RetryPolicy]; ok {
+				return &rp
+			}
+			break
+		}
+	}
 	return nil
 }
 
-// 计算重试延迟
-func (e *DistributedEngine) calculateRetryDelay(policy RetryPolicy, attempt int) time.Duration {
-	switch policy.BackoffAlgorithm {
+func calculateDelay(p RetryPolicy, attempt int) time.Duration {
+	switch p.BackoffAlgorithm {
 	case "exponential":
-		delay := float64(policy.InitialIntervalMs) * math.Pow(policy.Multiplier, float64(attempt))
-		if max := float64(policy.MaxIntervalMs); delay > max {
+		delay := float64(p.InitialIntervalMs) * math.Pow(p.Multiplier, float64(attempt))
+		if max := float64(p.MaxIntervalMs); delay > max {
 			delay = max
 		}
 		return time.Duration(delay) * time.Millisecond
-
 	case "fixed":
-		return time.Duration(policy.IntervalMs) * time.Millisecond
-
+		return time.Duration(p.IntervalMs) * time.Millisecond
 	default:
-		return time.Duration(policy.InitialIntervalMs) * time.Millisecond
+		return time.Duration(p.InitialIntervalMs) * time.Millisecond
 	}
-}
-
-// 执行单个Action
-func (e *DistributedEngine) executeSingleAction(ctx context.Context, task *TaskInstance) (string, error) {
-	actionConfig := e.getActionConfig(task.ActionID)
-
-	switch actionConfig.Type {
-	case "HTTP_RPC":
-		return e.executeHTTPAction(ctx, actionConfig, task.InputParams)
-	default:
-		return "", fmt.Errorf("不支持的Action类型: %s", actionConfig.Type)
-	}
-}
-
-// 执行HTTP Action
-func (e *DistributedEngine) executeHTTPAction(ctx context.Context, action *ActionConfig, params string) (string, error) {
-	endpoint, _ := action.Config["endpoint"].(string)
-	method, _ := action.Config["method"].(string)
-
-	// 这里简化处理，实际应该渲染模板
-	requestBody := action.RequestTemplate
-
-	result, err := e.httpClient.DoRequest(method, endpoint, requestBody)
-	if err != nil {
-		return "", fmt.Errorf("HTTP请求失败: %v", err)
-	}
-
-	return result, nil
 }
