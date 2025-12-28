@@ -25,13 +25,17 @@ type RetryPolicy struct {
 }
 
 type ActionConfig struct {
-	ID              string                 `yaml:"id" json:"id"`
-	Name            string                 `yaml:"name" json:"name"`
-	Type            string                 `yaml:"type" json:"type"`
-	ComponentID     string                 `yaml:"component" json:"component"`
-	Config          map[string]interface{} `yaml:"config" json:"config"`
-	RetryPolicy     string                 `yaml:"retryPolicy" json:"retryPolicy"`
-	RequestTemplate string                 `yaml:"requestTemplate" json:"requestTemplate"`
+	ID          string                 `yaml:"id" json:"id"`
+	Name        string                 `yaml:"name" json:"name"`
+	Type        string                 `yaml:"type" json:"type"`
+	Component   string                 `yaml:"component" json:"component"`
+	Config      map[string]interface{} `yaml:"config" json:"config"`
+	RetryPolicy struct {
+		ID              int    `yaml:"id" json:"id"`
+		MaxAttempts     int    `yaml:"max_attempts" json:"max_attempts"`
+		BackoffStrategy string `yaml:"backoff_strategy" json:"backoff_strategy"`
+	} `yaml:"retry_policy" json:"retry_policy"`
+	RequestTemplate string `yaml:"requestTemplate" json:"requestTemplate"`
 }
 
 type TransactionFlow struct {
@@ -82,7 +86,7 @@ func NewDistributedEngine(loader FlowLoader) (*DistributedEngine, error) {
 // ExecuteTransaction drives a single transaction identified by txID (generated if empty).
 // params is serialized and passed as payload to Try.
 func (e *DistributedEngine) ExecuteTransaction(ctx context.Context, flowID string, params map[string]interface{}) (string, error) {
-	txID := GenerateTransactionID()
+	txID := common.GenerateTransactionID()
 	// load flow by id
 	flow, err := e.FlowLoader(ctx, flowID)
 	if err != nil {
@@ -131,9 +135,9 @@ func (e *DistributedEngine) buildTasks(flow *TransactionFlow, params map[string]
 	for _, a := range flow.Actions {
 		// marshal action config to json.RawMessage for factory
 		cfgBytes, _ := json.Marshal(a.Config)
-		comp, err := register.BuildComponent(a.ComponentID, cfgBytes)
+		comp, err := register.BuildComponent(a.Component, cfgBytes)
 		if err != nil {
-			return nil, fmt.Errorf("无法构建组件 %s: %w", a.ComponentID, err)
+			return nil, fmt.Errorf("无法构建组件 %s: %w", a.Component, err)
 		}
 		// Prepare and Validate lifecycle
 		if err := comp.Prepare(cfgBytes); err != nil {
@@ -241,6 +245,25 @@ func (e *DistributedEngine) resolveRetryPolicyForAction(flow *TransactionFlow, a
 	// find action config
 	for _, a := range flow.Actions {
 		if a.ID == actionID {
+			// prefer inline retry_policy on action
+			if a.RetryPolicy.MaxAttempts > 0 {
+				rp := &RetryPolicy{}
+				rp.MaxAttempts = a.RetryPolicy.MaxAttempts
+				switch a.RetryPolicy.BackoffStrategy {
+				case "exponential":
+					rp.BackoffAlgorithm = "exponential"
+					rp.InitialIntervalMs = 1000
+					rp.Multiplier = 2
+					rp.MaxIntervalMs = 30000
+				case "fixed":
+					rp.BackoffAlgorithm = "fixed"
+					rp.IntervalMs = 1000
+				default:
+					rp.BackoffAlgorithm = "fixed"
+					rp.IntervalMs = 1000
+				}
+				return rp
+			}
 			if rp, ok := flow.RetryPolicies[a.RetryPolicy]; ok {
 				return &rp
 			}
